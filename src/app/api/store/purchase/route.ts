@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import type { PrismaClient } from "@prisma/client";
+import type { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/currentUser";
 
@@ -27,9 +27,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    await prisma.$transaction(async (tx: PrismaClient) => {
-      // Atomic guard: only proceeds if the user still has enough coins right
-      // now, avoiding a race where two requests both pass the earlier check.
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
       const deducted = await tx.user.updateMany({
         where: { id: user.id, coins: { gte: item.price } },
         data: { coins: { decrement: item.price } }

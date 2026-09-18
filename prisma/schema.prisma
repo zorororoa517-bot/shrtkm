@@ -1,0 +1,436 @@
+// ============================================================
+// Dawwar — Roulette Game Schema
+// SQLite for local/dev (zero setup). Swap provider to
+// "postgresql" + DATABASE_URL for production — no model
+// changes needed, Prisma handles the dialect.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum RoomStatus {
+  LOBBY
+  SPINNING
+  AWAITING_TARGET
+  FINISHED
+}
+
+enum TurnAction {
+  ELIMINATE
+  REVIVE
+  SKIP_KICK
+  SKIP_NO_KICK
+}
+
+// ============================================================
+// Persistent account (Twitch login) — separate from the
+// per-room "Player" rows, which only live for that one game.
+// A Player links back here via `login` when the user is signed
+// in with Twitch, so wins/coins/purchases carry across games.
+// ============================================================
+model User {
+  id             String   @id @default(cuid())
+  twitchId       String?  @unique
+  login          String   @unique // lowercase twitch login; "guest_xxx" for guests
+  displayName    String
+  avatarUrl      String?
+  email          String?
+  coins          Int      @default(0)
+  isAdmin        Boolean  @default(false)
+  specialBadges  String   @default("[]") // JSON array of admin-granted badge ids (owner/verified/staff/vip/...)
+  currentStreak  Int      @default(0) // متتالية أيام الحضور المتواصلة
+  lastActiveDate DateTime? // آخر يوم "لمسنا" فيه المتتالية (يوم تقويمي، تجاهل الوقت)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  purchases StoreItemPurchase[]
+  wins      Winner[]
+}
+
+enum StoreCategory {
+  AVATAR_FRAME
+  PROFILE_BANNER
+}
+
+model StoreItem {
+  id          String        @id @default(cuid())
+  slug        String        @unique
+  name        String
+  category    StoreCategory
+  price       Int
+  previewCss  String // CSS snippet (border or gradient) used to render the preview
+  createdAt   DateTime      @default(now())
+
+  purchases StoreItemPurchase[]
+}
+
+model StoreItemPurchase {
+  id        String    @id @default(cuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  itemId    String
+  item      StoreItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  createdAt DateTime  @default(now())
+
+  @@unique([userId, itemId])
+  @@index([userId])
+}
+
+model Room {
+  id                String     @id @default(cuid())
+  code              String     @unique
+  status            RoomStatus @default(LOBBY)
+  lockJoin          Boolean    @default(false)
+  spinSeconds       Float      @default(4.2)
+  finalWinsNeeded   Int        @default(3)
+  colorByChat       Boolean    @default(false)
+  revivePhaseActive Boolean    @default(false)
+  currentTurnId     String?
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @updatedAt
+
+  players    Player[]
+  turnEvents TurnEvent[]
+  winners    Winner[]
+}
+
+model Player {
+  id            String   @id @default(cuid())
+  roomId        String
+  room          Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  login         String
+  name          String
+  color         String
+  letter        String
+  isHost        Boolean  @default(false)
+  isEliminated  Boolean  @default(false)
+  hasRevived    Boolean  @default(false)
+  wasRevived    Boolean  @default(false)
+  hasDoubleElim Boolean  @default(false)
+  joinOrder     Int
+  createdAt     DateTime @default(now())
+
+  actedEvents    TurnEvent[] @relation("ActorPlayer")
+  targetedEvents TurnEvent[] @relation("TargetPlayer")
+  wins           Winner[]
+
+  @@index([roomId])
+  @@unique([roomId, login])
+}
+
+model TurnEvent {
+  id             String     @id @default(cuid())
+  roomId         String
+  room           Room       @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  actorPlayerId  String
+  actorPlayer    Player     @relation("ActorPlayer", fields: [actorPlayerId], references: [id], onDelete: Cascade)
+  targetPlayerId String?
+  targetPlayer   Player?    @relation("TargetPlayer", fields: [targetPlayerId], references: [id], onDelete: SetNull)
+  action         TurnAction
+  createdAt      DateTime   @default(now())
+
+  @@index([roomId, createdAt])
+}
+
+model Winner {
+  id        String   @id @default(cuid())
+  roomId    String
+  room      Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  playerId  String
+  player    Player   @relation(fields: [playerId], references: [id], onDelete: Cascade)
+  userId    String? // linked when the winning player was signed in with Twitch
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@index([roomId])
+  @@index([userId])
+}
+
+// ============================================================
+// Trivia engine — shared by every "type the right answer" game:
+// خلية الحروف، أسرع كلمة، تخمين الأعلام، تخمين العواصم،
+// تخمين الإيموجي، الكويز. Each game is just a different
+// `gameSlug` + question bank (kept server-side in code, never
+// sent to the client, so viewers can't peek at the answer key).
+// ============================================================
+enum TriviaStatus {
+  LOBBY
+  ACTIVE
+  FINISHED
+}
+
+model TriviaRoom {
+  id           String       @id @default(cuid())
+  code         String       @unique
+  gameSlug     String // "letter-cell" | "fastest-word" | "flags-guess" | "capitals-guess" | "emoji-guess" | "quiz"
+  status       TriviaStatus @default(LOBBY)
+  deckOrder    String // JSON-encoded shuffled array of question indices
+  currentIndex Int          @default(0)
+  roundNum     Int          @default(0)
+  roundLimit   Int          @default(10)
+  timerSeconds Int          @default(20)
+  roundStartAt DateTime?
+  answered     Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  scores TriviaScore[]
+}
+
+model TriviaScore {
+  id        String     @id @default(cuid())
+  roomId    String
+  room      TriviaRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  login     String
+  name      String
+  color     String
+  score     Int        @default(0)
+
+  @@unique([roomId, login])
+  @@index([roomId])
+}
+
+// ============================================================
+// Memory game — matching-pairs board with the star/level system
+// (5/10/15+ pairs matched = 1/2/4 level jump, same rule that was
+// added to the original HTML version).
+// ============================================================
+model MemoryGameState {
+  id            String   @id @default(cuid())
+  code          String   @unique
+  level         Int      @default(1)
+  pairCount     Int      @default(6)
+  durationSecs  Int      @default(180)
+  cardOrder     String // JSON-encoded array of icon ids, one per card
+  flippedA      Int? // index of first currently-flipped (unmatched) card
+  matchedIdx    String   @default("[]") // JSON-encoded array of matched card indices
+  matches       Int      @default(0)
+  status        String   @default("LOBBY") // LOBBY | ACTIVE | FINISHED
+  roundStartAt  DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  scores MemoryScore[]
+}
+
+model MemoryScore {
+  id      String          @id @default(cuid())
+  gameId  String
+  game    MemoryGameState @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  login   String
+  name    String
+  color   String
+  score   Int             @default(0)
+
+  @@unique([gameId, login])
+  @@index([gameId])
+}
+
+// ============================================================
+// الكراسي الموسيقية — N مشارك، N-1 كرسي. مرحلة "moving" (الموسيقى
+// تشتغل والسيرفر بس يعد الوقت)، وبعدها "claiming" حيث كل لاعب
+// يحجز رقم كرسي بالضغط (بدل الكتابة بالشات بالنسخة القديمة).
+// الأطوار تتحول تلقائياً بمجرد ما أي طلب GET/POST يوصل بعد ما
+// ينتهي وقت الطور (بدون Cron، مناسب لبنية polling).
+// ============================================================
+enum ChairsStatus {
+  LOBBY
+  MOVING
+  CLAIMING
+  FINISHED
+}
+
+model ChairsRoom {
+  id            String       @id @default(cuid())
+  code          String       @unique
+  status        ChairsStatus @default(LOBBY)
+  round         Int          @default(0)
+  moveSeconds   Int          @default(8)
+  claimSeconds  Int          @default(8)
+  chairNumbers  String       @default("[]") // JSON: أرقام الكراسي هالجولة
+  claims        String       @default("{}") // JSON: { [playerId]: chairNumber }
+  phaseStartAt  DateTime?
+  winnerId      String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  players ChairsPlayer[]
+}
+
+model ChairsPlayer {
+  id           String     @id @default(cuid())
+  roomId       String
+  room         ChairsRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  login        String
+  name         String
+  color        String
+  letter       String
+  isHost       Boolean    @default(false)
+  isEliminated Boolean    @default(false)
+  joinOrder    Int
+  createdAt    DateTime   @default(now())
+
+  @@unique([roomId, login])
+  @@index([roomId])
+}
+
+// ============================================================
+// صراع الفواكه — كل لاعب ياخذ فاكهة سرية. كل جولة تصويت الكل
+// يصوّت (بالضغط بدل الشات) على الفاكهة اللي يبونها تطلع؛ صاحب
+// أعلى فاكهة تصويتاً يطلع من اللعبة. آخر لاعب ناجي يفوز.
+// ============================================================
+enum FruitWarStatus {
+  LOBBY
+  VOTING
+  FINISHED
+}
+
+model FruitWarRoom {
+  id           String         @id @default(cuid())
+  code         String         @unique
+  status       FruitWarStatus @default(LOBBY)
+  round        Int            @default(0)
+  voteSeconds  Int            @default(30)
+  phaseStartAt DateTime?
+  winnerId     String?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  players FruitWarPlayer[]
+}
+
+model FruitWarPlayer {
+  id           String       @id @default(cuid())
+  roomId       String
+  room         FruitWarRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  login        String
+  name         String
+  color        String
+  letter       String
+  isHost       Boolean      @default(false)
+  isEliminated Boolean      @default(false)
+  fruitLabel   String       @default("")
+  votes        Int          @default(0) // أصوات هالجولة بس (تصفر كل جولة)
+  votedForId   String?      // مين صوّت له هالجولة (يمنع تكرار/يسمح بتغيير الصوت)
+  joinOrder    Int
+  createdAt    DateTime     @default(now())
+
+  @@unique([roomId, login])
+  @@index([roomId])
+}
+
+// ============================================================
+// تصادم السيوف — كل جولة "معركة" مدتها ثواني معدودة، كل لاعب
+// يقدر يضغط "اضرب ⚔️" عدة مرات عشان يجمع قوة. لين ينتهي الوقت،
+// أضعف لاعب (أقل قوة، والتعادل يُحسم عشوائياً) يطلع من الحلبة.
+// ============================================================
+enum SwordClashStatus {
+  LOBBY
+  BATTLE
+  FINISHED
+}
+
+model SwordClashRoom {
+  id             String           @id @default(cuid())
+  code           String           @unique
+  status         SwordClashStatus @default(LOBBY)
+  round          Int              @default(0)
+  battleSeconds  Int              @default(15)
+  phaseStartAt   DateTime?
+  winnerId       String?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  players SwordClashPlayer[]
+}
+
+model SwordClashPlayer {
+  id           String         @id @default(cuid())
+  roomId       String
+  room         SwordClashRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  login        String
+  name         String
+  color        String
+  letter       String
+  isHost       Boolean        @default(false)
+  isEliminated Boolean        @default(false)
+  power        Int            @default(0) // يصفر أول كل جولة معركة
+  joinOrder    Int
+  createdAt    DateTime       @default(now())
+
+  @@unique([roomId, login])
+  @@index([roomId])
+}
+
+// ============================================================
+// تحدي الرسم — لاعب يرسم (دوره يتناوب)، والباقي يخمنون الكلمة.
+// خط الرسم يتخزن كنقاط JSON (strokes) يقرأها الكل بالـ polling.
+// الكلمة السرية ما ترجع أبداً إلا للرسّام الحالي.
+// ============================================================
+enum DrawingStatus {
+  LOBBY
+  CHOOSING
+  DRAWING
+  FINISHED
+}
+
+model DrawingRoom {
+  id            String        @id @default(cuid())
+  code          String        @unique
+  status        DrawingStatus @default(LOBBY)
+  round         Int           @default(0)
+  roundLimit    Int           @default(6)
+  drawSeconds   Int           @default(60)
+  chooseSeconds Int           @default(12)
+  currentWord   String        @default("") // سري، ما يرجع إلا للرسّام
+  wordChoices   String        @default("[]") // JSON: 3 خيارات وقت الاختيار
+  strokes       String        @default("[]") // JSON: مصفوفة الخطوط
+  correctLogins String        @default("[]") // JSON: مين خمّن صح هالجولة
+  drawerIndex   Int           @default(0) // فهرس الرسّام الحالي بترتيب اللاعبين
+  phaseStartAt  DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  players DrawingPlayer[]
+}
+
+model DrawingPlayer {
+  id        String      @id @default(cuid())
+  roomId    String
+  room      DrawingRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  login     String
+  name      String
+  color     String
+  letter    String
+  isHost    Boolean     @default(false)
+  score     Int         @default(0)
+  joinOrder Int
+  createdAt DateTime    @default(now())
+
+  @@unique([roomId, login])
+  @@index([roomId])
+}
+
+// ============================================================
+// المهام والشارات — يتحسبون من بيانات موجودة أصلاً (الفوز،
+// النقاط، الشراء) بدل جدول منفصل لكل تعريف؛ فقط تقدّم كل لاعب
+// (progress) يتخزن هنا عشان "أنجزت المهمة اليوم" ما يتكرر.
+// ============================================================
+model TaskProgress {
+  id          String   @id @default(cuid())
+  login       String
+  taskId      String // مفتاح المهمة الثابت بالكود، مثل "win_1"
+  progress    Int      @default(0)
+  claimed     Boolean  @default(false)
+  periodKey   String // "all" لمهمة دائمة أو تاريخ اليوم لمهمة يومية
+  updatedAt   DateTime @updatedAt
+
+  @@unique([login, taskId, periodKey])
+  @@index([login])
+}
